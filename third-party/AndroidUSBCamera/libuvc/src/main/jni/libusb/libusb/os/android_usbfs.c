@@ -60,6 +60,14 @@
 #include "libusbi.h"
 #include "android_usbfs.h"
 
+/* Set to 1 to re-enable TDRUSB3 debug logging for USB transfer diagnostics. */
+#define TDRUSB3_DEBUG_LOGS 0
+#if TDRUSB3_DEBUG_LOGS
+#define TDRUSB3_LOGI(...) LOGI(__VA_ARGS__)
+#else
+#define TDRUSB3_LOGI(...) do {} while (0)
+#endif
+
 /* sysfs vs usbfs:
  * opening a usbfs node causes the device to be resumed, so we attempt to
  * avoid this during enumeration.
@@ -1429,10 +1437,10 @@ static int android_initialize_device(struct libusb_device *dev,
 	speed = android_sysfs_speed_for_bus_dev(ctx, busnum, devaddr);
 	if (speed >= 0) {
 		android_set_device_speed_from_sysfs_mbps(dev, speed);
-		LOGI("TDRUSB3 device open sysfs_speed=%dMbps libusb_speed=%d bus=%u dev=%u",
+		TDRUSB3_LOGI("TDRUSB3 device open sysfs_speed=%dMbps libusb_speed=%d bus=%u dev=%u",
 			speed, dev->speed, busnum, devaddr);
 	} else {
-		LOGI("TDRUSB3 device open sysfs_speed=unknown libusb_speed=%d bus=%u dev=%u",
+		TDRUSB3_LOGI("TDRUSB3 device open sysfs_speed=unknown libusb_speed=%d bus=%u dev=%u",
 			dev->speed, busnum, devaddr);
 	}
 
@@ -1747,7 +1755,7 @@ static int op_open(struct libusb_device_handle *handle) {
 			hpriv->caps |= USBFS_CAP_BULK_CONTINUATION;
 	}
 
-	LOGI("TDRUSB3 usbfs caps=0x%x NO_PACKET_SIZE_LIM=%d bus=%u dev=%u",
+	TDRUSB3_LOGI("TDRUSB3 usbfs caps=0x%x NO_PACKET_SIZE_LIM=%d bus=%u dev=%u",
 		hpriv->caps,
 		!!(hpriv->caps & USBFS_CAP_NO_PACKET_SIZE_LIM),
 		handle->dev->bus_number,
@@ -2440,7 +2448,7 @@ static int submit_iso_transfer(struct usbi_transfer *itransfer) {
 		}
 	}
 	if (tdrusb3_log_this_submit)
-		LOGI("TDRUSB3 urb packing need=%d urbs max_urb_len=%u packets=%d",
+		TDRUSB3_LOGI("TDRUSB3 urb packing need=%d urbs max_urb_len=%u packets=%d",
 			num_urbs, max_urb_len, num_packets);
 	usbi_dbg("need %d URBs of up to %u bytes for transfer", num_urbs, max_urb_len);
 
@@ -2479,7 +2487,7 @@ static int submit_iso_transfer(struct usbi_transfer *itransfer) {
 		}
 
 		if (tdrusb3_log_this_submit)
-			LOGI("TDRUSB3 urb[%d] packets=%d bytes=%u", i, urb_packet_offset, urb_len);
+			TDRUSB3_LOGI("TDRUSB3 urb[%d] packets=%d bytes=%u", i, urb_packet_offset, urb_len);
 
 		alloc_size = sizeof(*urb)
 			+ (urb_packet_offset * sizeof(struct usbfs_iso_packet_desc));
