@@ -63,6 +63,37 @@
 #include "libuvc/libuvc_internal.h"
 #include <errno.h>
 
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
+
+static int tdrusb3_iso_xfer_log_count;
+static int tdrusb3_frame_log_count;
+/* Per-frame packet stats, reset at each publish. Written only from the
+ * streaming callback thread. */
+static int tdrusb3_pkt_data;
+static int tdrusb3_pkt_zero;
+static int tdrusb3_pkt_status_err;
+static int tdrusb3_pkt_hdr_err;
+static int tdrusb3_clear_halt_calls;
+static const char *tdrusb3_publish_reason = "none";
+/* Exact size of a complete raw frame (0 when unknown), set at stream start. */
+static size_t tdrusb3_exact_frame_bytes;
+
+#ifdef __ANDROID__
+static int tdrusb3_force_hs_sizing(void) {
+	char value[PROP_VALUE_MAX] = {0};
+
+	if (__system_property_get("debug.uvc.tdr.force_hs_sizing", value) <= 0)
+		return 0;
+	return value[0] == '1' || value[0] == 'y' || value[0] == 'Y';
+}
+#else
+static int tdrusb3_force_hs_sizing(void) {
+	return 0;
+}
+#endif
+
 uvc_frame_desc_t *uvc_find_frame_desc_stream(uvc_stream_handle_t *strmh,
 		uint16_t format_id, uint16_t frame_id);
 uvc_frame_desc_t *uvc_find_frame_desc(uvc_device_handle_t *devh,
@@ -471,6 +502,19 @@ static uvc_error_t _uvc_get_stream_ctrl_format(uvc_device_handle_t *devh,
 		uint32_t *interval;
 
 		if (frame->intervals) {
+			uint32_t *dump;
+
+			for (dump = frame->intervals; *dump; ++dump)
+				LOGI("TDRUSB3 frame_desc %ux%u supports interval=%u (%u fps)",
+					frame->wWidth, frame->wHeight, *dump,
+					*dump ? 10000000 / *dump : 0);
+		} else {
+			LOGI("TDRUSB3 frame_desc %ux%u supports interval min=%u max=%u step=%u",
+				frame->wWidth, frame->wHeight, frame->dwMinFrameInterval,
+				frame->dwMaxFrameInterval, frame->dwFrameIntervalStep);
+		}
+
+		if (frame->intervals) {
 			for (interval = frame->intervals; *interval; ++interval) {
 				if (UNLIKELY(!(*interval))) continue;
 				uint32_t it = 10000000 / *interval;
@@ -621,6 +665,23 @@ static void _uvc_swap_buffers(uvc_stream_handle_t *strmh) {
 		strmh->hold_last_scr = strmh->last_scr;
 		strmh->hold_pts = strmh->pts;
 		strmh->hold_seq = strmh->seq;
+
+		/* Frames arrive a few times per second at most, so log them all;
+		 * expected size lets truncated/merged frames stand out. */
+		tdrusb3_frame_log_count++;
+		LOGI("TDRUSB3 publish frame seq=%d bytes=%zu expected=%u reason=%s bfh_err=%d pkts data=%d zero=%d status_err=%d hdr_err=%d clear_halt=%d",
+			tdrusb3_frame_log_count, strmh->got_bytes,
+			strmh->cur_ctrl.dwMaxVideoFrameSize,
+			tdrusb3_publish_reason, strmh->bfh_err,
+			tdrusb3_pkt_data, tdrusb3_pkt_zero,
+			tdrusb3_pkt_status_err, tdrusb3_pkt_hdr_err,
+			tdrusb3_clear_halt_calls);
+		tdrusb3_pkt_data = 0;
+		tdrusb3_pkt_zero = 0;
+		tdrusb3_pkt_status_err = 0;
+		tdrusb3_pkt_hdr_err = 0;
+		tdrusb3_clear_halt_calls = 0;
+		tdrusb3_publish_reason = "none";
 
 		pthread_cond_broadcast(&strmh->cb_cond);
 	}
@@ -834,6 +895,8 @@ static inline void _uvc_process_payload_iso(uvc_stream_handle_t *strmh, struct l
 		if (UNLIKELY(pkt->status != 0)) {
 			MARK("bad packet:status=%d,actual_length=%d", pkt->status, pkt->actual_length);
 			strmh->bfh_err |= UVC_STREAM_ERR;
+			tdrusb3_pkt_status_err++;
+			tdrusb3_clear_halt_calls++;
 			libusb_clear_halt(strmh->devh->usb_devh, strmh->stream_if->bEndpointAddress);
 //			uvc_vc_get_error_code(strmh->devh, &vc_error_code, UVC_GET_CUR);
 //			uvc_vs_get_error_code(strmh->devh, &vs_error_code, UVC_GET_CUR);
@@ -843,6 +906,7 @@ static inline void _uvc_process_payload_iso(uvc_stream_handle_t *strmh, struct l
 		if (UNLIKELY(!pkt->actual_length)) {	// why transfered byte is zero...
 //			MARK("zero packet (transfer):");
 //			strmh->bfh_err |= UVC_STREAM_ERR;	// don't set this flag here
+			tdrusb3_pkt_zero++;
 			continue;
 		}
 		// XXX accessing to pktbuf could lead to crash on the original implementation
@@ -874,6 +938,8 @@ static inline void _uvc_process_payload_iso(uvc_stream_handle_t *strmh, struct l
 				if (UNLIKELY(header_info & UVC_STREAM_ERR)) {
 //					strmh->bfh_err |= UVC_STREAM_ERR;
 					MARK("bad packet:status=0x%2x", header_info);
+					tdrusb3_pkt_hdr_err++;
+					tdrusb3_clear_halt_calls++;
 					libusb_clear_halt(strmh->devh->usb_devh, strmh->stream_if->bEndpointAddress);
 //					uvc_vc_get_error_code(strmh->devh, &vc_error_code, UVC_GET_CUR);
 					uvc_vs_get_error_code(strmh->devh, &vs_error_code, UVC_GET_CUR);
@@ -884,6 +950,7 @@ static inline void _uvc_process_payload_iso(uvc_stream_handle_t *strmh, struct l
 				/* The frame ID bit was flipped, but we have image data sitting
 	             around from prior transfers. This means the camera didn't send
     		     an EOF for the last transfer of the previous frame or some frames losted. */
+					tdrusb3_publish_reason = "fid_toggle";
 					_uvc_swap_buffers(strmh);
 				}
 				strmh->fid = header_info & UVC_STREAM_FID;
@@ -942,10 +1009,28 @@ static inline void _uvc_process_payload_iso(uvc_stream_handle_t *strmh, struct l
 				assert(pktbuf);
 				memcpy(strmh->outbuf + strmh->got_bytes, pktbuf + header_len, odd_bytes);
 				strmh->got_bytes += odd_bytes;
+				tdrusb3_pkt_data++;
 			}
 #ifdef USE_EOF
 			if ((pktbuf[1] & UVC_STREAM_EOF) && strmh->got_bytes != 0) {
+				/* On a congested link the camera can stall mid-frame and lose
+				 * the FID toggle, so the previous frame's tail ends up merged
+				 * in front of this EOF-terminated frame. The frame that ends
+				 * here streamed after the stall and is intact, so keep its
+				 * exact-size tail and drop the stray leading bytes. */
+				if (tdrusb3_exact_frame_bytes
+						&& strmh->got_bytes > tdrusb3_exact_frame_bytes) {
+					const size_t excess =
+						strmh->got_bytes - tdrusb3_exact_frame_bytes;
+
+					LOGI("TDRUSB3 eof oversized got=%zu exact=%zu, keeping tail (dropping %zu leading bytes)",
+						strmh->got_bytes, tdrusb3_exact_frame_bytes, excess);
+					memmove(strmh->outbuf, strmh->outbuf + excess,
+						tdrusb3_exact_frame_bytes);
+					strmh->got_bytes = tdrusb3_exact_frame_bytes;
+				}
 				/* The EOF bit is set, so publish the complete frame */
+				tdrusb3_publish_reason = "eof";
 				_uvc_swap_buffers(strmh);
 			}
 #endif
@@ -985,6 +1070,25 @@ static void _uvc_stream_callback(struct libusb_transfer *transfer) {
 			/* This is a bulk mode transfer, so it just has one payload transfer */
 			_uvc_process_payload(strmh, transfer->buffer, transfer->actual_length);
 		} else {
+			/* Log the first 8 transfers, then sample every 256th (~1/sec on
+			 * USB 2.0) so sustained throughput stays visible without flooding
+			 * logd from the streaming hot path. */
+			tdrusb3_iso_xfer_log_count++;
+			if (tdrusb3_iso_xfer_log_count <= 8
+					|| (tdrusb3_iso_xfer_log_count & 0xff) == 0) {
+				int nonzero = 0;
+				int total_actual = 0;
+				int p;
+
+				for (p = 0; p < transfer->num_iso_packets; p++) {
+					total_actual += transfer->iso_packet_desc[p].actual_length;
+					if (transfer->iso_packet_desc[p].actual_length > 0)
+						nonzero++;
+				}
+				LOGI("TDRUSB3 iso_cb xfer=%d packets=%d nonzero=%d total_actual=%d status=%d",
+					tdrusb3_iso_xfer_log_count, transfer->num_iso_packets, nonzero,
+					total_actual, transfer->status);
+			}
 			/* This is an isochronous mode transfer, so each packet has a payload transfer */
 			_uvc_process_payload_iso(strmh, transfer);
 		}
@@ -1412,6 +1516,14 @@ uvc_error_t uvc_stream_start_bandwidth(uvc_stream_handle_t *strmh,
 	strmh->running = 1;
 	strmh->seq = 0;
 	strmh->fid = 0;
+	tdrusb3_iso_xfer_log_count = 0;
+	tdrusb3_frame_log_count = 0;
+	tdrusb3_pkt_data = 0;
+	tdrusb3_pkt_zero = 0;
+	tdrusb3_pkt_status_err = 0;
+	tdrusb3_pkt_hdr_err = 0;
+	tdrusb3_clear_halt_calls = 0;
+	tdrusb3_publish_reason = "none";
 	strmh->pts = 0;
 	strmh->last_scr = 0;
 	strmh->bfh_err = 0;	// XXX
@@ -1430,6 +1542,17 @@ uvc_error_t uvc_stream_start_bandwidth(uvc_stream_handle_t *strmh,
 		LOGE("unlnown frame format");
 		goto fail;
 	}
+	/* For fixed-size raw formats the exact frame size is known up front,
+	 * which lets the iso path trim merged frames down to the real frame. */
+	if (strmh->frame_format == UVC_FRAME_FORMAT_NV12) {
+		tdrusb3_exact_frame_bytes =
+			(size_t)frame_desc->wWidth * frame_desc->wHeight * 3 / 2;
+	} else {
+		tdrusb3_exact_frame_bytes = 0;
+	}
+	LOGI("TDRUSB3 exact_frame_bytes=%zu (%ux%u fmt=%d)",
+		tdrusb3_exact_frame_bytes, frame_desc->wWidth, frame_desc->wHeight,
+		strmh->frame_format);
 	const uint32_t dwMaxVideoFrameSize = ctrl->dwMaxVideoFrameSize <= frame_desc->dwMaxVideoFrameBufferSize
 		? ctrl->dwMaxVideoFrameSize : frame_desc->dwMaxVideoFrameBufferSize;
 
@@ -1485,6 +1608,45 @@ uvc_error_t uvc_stream_start_bandwidth(uvc_stream_handle_t *strmh,
 		 * as big as our format's maximum per-packet usage. Assume that the
 		 * packet sizes are increasing. */
 		const int num_alt = interface->num_altsetting - 1;
+		const int force_hs_sizing = tdrusb3_force_hs_sizing();
+		int used_ss_sizing = 0;
+
+		LOGI("TDRUSB3 stream_start isochronous altsettings=%d target_ep=0x%02x config_bytes_per_packet=%zu force_hs_sizing=%d dwFrameInterval=%u dwMaxVideoFrameSize=%u",
+			interface->num_altsetting, format_desc->parent->bEndpointAddress,
+			config_bytes_per_packet, force_hs_sizing,
+			strmh->cur_ctrl.dwFrameInterval, strmh->cur_ctrl.dwMaxVideoFrameSize);
+		for (alt_idx = 0; alt_idx <= num_alt; alt_idx++) {
+			altsetting = interface->altsetting + alt_idx;
+			for (ep_idx = 0; ep_idx < altsetting->bNumEndpoints; ep_idx++) {
+				struct libusb_ss_endpoint_companion_descriptor *dump_comp = NULL;
+
+				endpoint = altsetting->endpoint + ep_idx;
+				{
+					size_t hs_bpp = (endpoint->wMaxPacketSize & 0x07ff)
+						* (((endpoint->wMaxPacketSize >> 11) & 3) + 1);
+					const char *xfer = (endpoint->bmAttributes & LIBUSB_TRANSFER_TYPE_MASK)
+						== LIBUSB_TRANSFER_TYPE_ISOCHRONOUS ? "iso" : "other";
+
+					LOGI("TDRUSB3 descriptor alt=%d ep=0x%02x %s wMaxPacketSize=%u hs_bpp=%zu",
+						altsetting->bAlternateSetting, endpoint->bEndpointAddress,
+						xfer, endpoint->wMaxPacketSize, hs_bpp);
+					if (!libusb_get_ss_endpoint_companion_descriptor(
+							strmh->devh->dev->ctx->usb_ctx, endpoint, &dump_comp)
+							&& dump_comp) {
+						LOGI("TDRUSB3 descriptor alt=%d ep=0x%02x ss_comp bMaxBurst=%u mult=%u wBytesPerInterval=%u",
+							altsetting->bAlternateSetting, endpoint->bEndpointAddress,
+							dump_comp->bMaxBurst,
+							((dump_comp->bmAttributes) & 3) + 1,
+							dump_comp->wBytesPerInterval);
+						libusb_free_ss_endpoint_companion_descriptor(dump_comp);
+					} else {
+						LOGI("TDRUSB3 descriptor alt=%d ep=0x%02x ss_comp=none",
+							altsetting->bAlternateSetting, endpoint->bEndpointAddress);
+					}
+				}
+			}
+		}
+
 		for (alt_idx = 0; alt_idx <= num_alt ; alt_idx++) {
 			altsetting = interface->altsetting + alt_idx;
 			endpoint_bytes_per_packet = 0;
@@ -1504,6 +1666,22 @@ uvc_error_t uvc_stream_start_bandwidth(uvc_stream_handle_t *strmh,
 					endpoint_bytes_per_packet
 						= (endpoint_bytes_per_packet & 0x07ff)
 							* (((endpoint_bytes_per_packet >> 11) & 3) + 1);
+					// The multiplier bits above are a high-speed convention and are always zero
+					// at SuperSpeed, where the bytes the endpoint moves per service interval are
+					// declared by the SuperSpeed Endpoint Companion Descriptor instead.
+					if (!force_hs_sizing) {
+						struct libusb_ss_endpoint_companion_descriptor *ss_comp = NULL;
+
+						if (!libusb_get_ss_endpoint_companion_descriptor(
+								strmh->devh->dev->ctx->usb_ctx, endpoint, &ss_comp)
+								&& ss_comp) {
+							if (ss_comp->wBytesPerInterval > endpoint_bytes_per_packet) {
+								endpoint_bytes_per_packet = ss_comp->wBytesPerInterval;
+								used_ss_sizing = 1;
+							}
+							libusb_free_ss_endpoint_companion_descriptor(ss_comp);
+						}
+					}
 					break;
 				}
 			}
@@ -1521,7 +1699,21 @@ uvc_error_t uvc_stream_start_bandwidth(uvc_stream_handle_t *strmh,
 					if (packets_per_transfer > 32)
 						packets_per_transfer = 32;
 
+					/* Keep the whole pool of queued buffers inside the usbfs budget */
+					if (packets_per_transfer * endpoint_bytes_per_packet * LIBUVC_NUM_TRANSFER_BUFS
+							> LIBUVC_TRANSFER_POOL_BUDGET) {
+						packets_per_transfer = LIBUVC_TRANSFER_POOL_BUDGET
+								/ (endpoint_bytes_per_packet * LIBUVC_NUM_TRANSFER_BUFS);
+						if (!packets_per_transfer)
+							packets_per_transfer = 1;
+					}
+
 					total_transfer_size = packets_per_transfer * endpoint_bytes_per_packet;
+					LOGI("TDRUSB3 iso_transfer_sizing branch=%s bytes_per_packet=%zu packets_per_transfer=%zu total_transfer_size=%zu pool_budget=%d",
+						force_hs_sizing ? "forced_hs"
+							: (used_ss_sizing ? "ss_companion" : "hs_wMaxPacketSize"),
+						endpoint_bytes_per_packet, packets_per_transfer, total_transfer_size,
+						LIBUVC_TRANSFER_POOL_BUDGET);
 					break;
 				}
 			}
