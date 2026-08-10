@@ -60,6 +60,14 @@
 #include "libusbi.h"
 #include "android_usbfs.h"
 
+/* Set to 1 to re-enable TDRUSB3 debug logging for USB transfer diagnostics. */
+#define TDRUSB3_DEBUG_LOGS 0
+#if TDRUSB3_DEBUG_LOGS
+#define TDRUSB3_LOGI(...) LOGI(__VA_ARGS__)
+#else
+#define TDRUSB3_LOGI(...) do {} while (0)
+#endif
+
 /* sysfs vs usbfs:
  * opening a usbfs node causes the device to be resumed, so we attempt to
  * avoid this during enumeration.
@@ -742,6 +750,61 @@ static int __read_sysfs_attr(struct libusb_context *ctx, const char *devname,
 	return value;
 }
 
+static int android_sysfs_speed_for_bus_dev(struct libusb_context *ctx,
+		uint8_t busnum, uint8_t devaddr) {
+	DIR *dir;
+	struct dirent *ent;
+	int bus, dev, speed;
+	int ret = -1;
+
+	dir = opendir(SYSFS_DEVICE_PATH);
+	if (!dir)
+		return -1;
+
+	while ((ent = readdir(dir)) != NULL) {
+		if (ent->d_name[0] == '.')
+			continue;
+
+		bus = __read_sysfs_attr(ctx, ent->d_name, "busnum");
+		if (bus < 0)
+			continue;
+		dev = __read_sysfs_attr(ctx, ent->d_name, "devnum");
+		if (dev < 0)
+			continue;
+		if (bus != (int)busnum || dev != (int)devaddr)
+			continue;
+
+		speed = __read_sysfs_attr(ctx, ent->d_name, "speed");
+		if (speed >= 0)
+			ret = speed;
+		break;
+	}
+
+	closedir(dir);
+	return ret;
+}
+
+static void android_set_device_speed_from_sysfs_mbps(struct libusb_device *dev,
+		int speed_mbps) {
+	switch (speed_mbps) {
+	case 1:
+		dev->speed = LIBUSB_SPEED_LOW;
+		break;
+	case 12:
+		dev->speed = LIBUSB_SPEED_FULL;
+		break;
+	case 480:
+		dev->speed = LIBUSB_SPEED_HIGH;
+		break;
+	case 5000:
+		dev->speed = LIBUSB_SPEED_SUPER;
+		break;
+	default:
+		usbi_warn(DEVICE_CTX(dev), "TDRUSB3 unknown sysfs speed=%d Mbps", speed_mbps);
+		dev->speed = LIBUSB_SPEED_UNKNOWN;
+	}
+}
+
 // XXX
 static int op_get_raw_descriptor(struct libusb_device *dev,
 		unsigned char *buffer, int *descriptors_len, int *host_endian) {
@@ -1371,6 +1434,16 @@ static int android_initialize_device(struct libusb_device *dev,
 		r = LIBUSB_SUCCESS;
 	} /* else r < 0, just return the error code */
 
+	speed = android_sysfs_speed_for_bus_dev(ctx, busnum, devaddr);
+	if (speed >= 0) {
+		android_set_device_speed_from_sysfs_mbps(dev, speed);
+		TDRUSB3_LOGI("TDRUSB3 device open sysfs_speed=%dMbps libusb_speed=%d bus=%u dev=%u",
+			speed, dev->speed, busnum, devaddr);
+	} else {
+		TDRUSB3_LOGI("TDRUSB3 device open sysfs_speed=unknown libusb_speed=%d bus=%u dev=%u",
+			dev->speed, busnum, devaddr);
+	}
+
 	RETURN(r, int);
 }
 
@@ -1681,6 +1754,12 @@ static int op_open(struct libusb_device_handle *handle) {
 		if (supports_flag_bulk_continuation)
 			hpriv->caps |= USBFS_CAP_BULK_CONTINUATION;
 	}
+
+	TDRUSB3_LOGI("TDRUSB3 usbfs caps=0x%x NO_PACKET_SIZE_LIM=%d bus=%u dev=%u",
+		hpriv->caps,
+		!!(hpriv->caps & USBFS_CAP_NO_PACKET_SIZE_LIM),
+		handle->dev->bus_number,
+		handle->dev->device_address);
 
 	return usbi_add_pollfd(HANDLE_CTX(handle), hpriv->fd, POLLOUT);
 }
@@ -2318,7 +2397,16 @@ static int submit_iso_transfer(struct usbi_transfer *itransfer) {
 	int num_urbs = 1;
 	int packet_offset = 0;
 	unsigned int packet_len;
+	unsigned int max_urb_len = MAX_ISO_BUFFER_LENGTH;
 	unsigned char *urb_buffer = transfer->buffer;
+	/* submit_iso_transfer runs on every transfer resubmission (hundreds of
+	 * times per second while streaming), so per-submit logging must be
+	 * rate-limited or it stalls the USB transfer thread and drops iso data. */
+	static int tdrusb3_pack_log_count;
+	const int tdrusb3_log_this_submit = tdrusb3_pack_log_count < 4;
+
+	if (tdrusb3_log_this_submit)
+		tdrusb3_pack_log_count++;
 
 	if (UNLIKELY(tpriv->iso_urbs))
 		return LIBUSB_ERROR_BUSY;
@@ -2332,21 +2420,37 @@ static int submit_iso_transfer(struct usbi_transfer *itransfer) {
 	 * using arbritary large transfers is still be a bad idea though, as
 	 * the kernel needs to allocate physical contiguous memory for this,
 	 * which may fail for large buffers.
+	 *
+	 * A SuperSpeed isochronous endpoint can move up to 48kb in one service
+	 * interval, so a single packet may exceed the legacy limit and there is no
+	 * way to split it across URBs. Grow the per-URB budget to the largest packet
+	 * when the kernel advertises that it has no packet size limit, otherwise the
+	 * loops below would build an URB holding zero packets, which usbfs rejects
+	 * with EINVAL.
 	 */
+	if (dpriv->caps & USBFS_CAP_NO_PACKET_SIZE_LIM) {
+		for (i = 0; i < num_packets; i++) {
+			packet_len = transfer->iso_packet_desc[i].length;
+			if (packet_len > max_urb_len)
+				max_urb_len = packet_len;
+		}
+	}
 
 	/* calculate how many URBs we need */
 	for (i = 0; i < num_packets; i++) {
-		unsigned int space_remaining = MAX_ISO_BUFFER_LENGTH - this_urb_len;
 		packet_len = transfer->iso_packet_desc[i].length;
 
-		if (packet_len > space_remaining) {
+		if (this_urb_len && (this_urb_len + packet_len > max_urb_len)) {
 			num_urbs++;
 			this_urb_len = packet_len;
 		} else {
 			this_urb_len += packet_len;
 		}
 	}
-	usbi_dbg("need %d of 32k URBs for transfer", num_urbs);
+	if (tdrusb3_log_this_submit)
+		TDRUSB3_LOGI("TDRUSB3 urb packing need=%d urbs max_urb_len=%u packets=%d",
+			num_urbs, max_urb_len, num_packets);
+	usbi_dbg("need %d URBs of up to %u bytes for transfer", num_urbs, max_urb_len);
 
 	alloc_size = num_urbs * sizeof(*urbs);
 	urbs = calloc(1, alloc_size);
@@ -2362,7 +2466,7 @@ static int submit_iso_transfer(struct usbi_transfer *itransfer) {
 	/* allocate + initialize each URB with the correct number of packets */
 	for (i = 0; i < num_urbs; i++) {
 		struct usbfs_urb *urb;
-		unsigned int space_remaining_in_urb = MAX_ISO_BUFFER_LENGTH;
+		unsigned int urb_len = 0;
 		int urb_packet_offset = 0;
 		unsigned char *urb_buffer_orig = urb_buffer;
 		int j;
@@ -2371,17 +2475,19 @@ static int submit_iso_transfer(struct usbi_transfer *itransfer) {
 		/* swallow up all the packets we can fit into this URB */
 		while (packet_offset < num_packets) {
 			packet_len = transfer->iso_packet_desc[packet_offset].length;
-			if (packet_len <= space_remaining_in_urb) {
-				/* throw it in */
-				urb_packet_offset++;
-				packet_offset++;
-				space_remaining_in_urb -= packet_len;
-				urb_buffer += packet_len;
-			} else {
+			if (urb_packet_offset && (urb_len + packet_len > max_urb_len)) {
 				/* it can't fit, save it for the next URB */
 				break;
 			}
+			/* throw it in */
+			urb_packet_offset++;
+			packet_offset++;
+			urb_len += packet_len;
+			urb_buffer += packet_len;
 		}
+
+		if (tdrusb3_log_this_submit)
+			TDRUSB3_LOGI("TDRUSB3 urb[%d] packets=%d bytes=%u", i, urb_packet_offset, urb_len);
 
 		alloc_size = sizeof(*urb)
 			+ (urb_packet_offset * sizeof(struct usbfs_iso_packet_desc));
@@ -2417,6 +2523,7 @@ static int submit_iso_transfer(struct usbi_transfer *itransfer) {
 			} else {
 				usbi_err(TRANSFER_CTX(transfer),
 					"submiturb failed error %d errno=%d", r, errno);
+				LOGE("TDRUSB3 urb submit failed urb=%d errno=%d", i, errno);
 				r = LIBUSB_ERROR_IO;
 			}
 
