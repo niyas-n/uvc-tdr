@@ -68,7 +68,7 @@
 #endif
 
 /* Set to 1 to re-enable TDRUSB3 debug logging for stream diagnostics. */
-#define TDRUSB3_DEBUG_LOGS 0
+#define TDRUSB3_DEBUG_LOGS 1
 #if TDRUSB3_DEBUG_LOGS
 #define TDRUSB3_LOGI(...) LOGI(__VA_ARGS__)
 #else
@@ -687,6 +687,17 @@ static void _uvc_swap_buffers(uvc_stream_handle_t *strmh) {
 		/* Frames arrive a few times per second at most, so log them all;
 		 * expected size lets truncated/merged frames stand out. */
 		tdrusb3_frame_log_count++;
+		if (tdrusb3_frame_log_count == 1) {
+			uvc_tdr_diag_append(
+				"stream first_frame bytes=%zu expected=%u bfh_err=%d data_packets=%d zero_packets=%d status_errors=%d header_errors=%d",
+				strmh->got_bytes,
+				strmh->cur_ctrl.dwMaxVideoFrameSize,
+				strmh->bfh_err,
+				tdrusb3_pkt_data,
+				tdrusb3_pkt_zero,
+				tdrusb3_pkt_status_err,
+				tdrusb3_pkt_hdr_err);
+		}
 		TDRUSB3_LOGI("TDRUSB3 publish frame seq=%d bytes=%zu expected=%u reason=%s bfh_err=%d seg_start=%zu pkts data=%d zero=%d status_err=%d hdr_err=%d clear_halt=%d",
 			tdrusb3_frame_log_count, strmh->got_bytes,
 			strmh->cur_ctrl.dwMaxVideoFrameSize,
@@ -956,6 +967,14 @@ static inline void _uvc_process_payload_iso(uvc_stream_handle_t *strmh, struct l
 //			strmh->bfh_err |= UVC_STREAM_ERR;	// don't set this flag here
 			tdrusb3_pkt_zero++;
 			tdrusb3_zero_run++;
+			if (tdrusb3_zero_run == TDRUSB3_STALL_ZERO_RUN ||
+				(tdrusb3_zero_run > TDRUSB3_STALL_ZERO_RUN &&
+					tdrusb3_zero_run % 256 == 0)) {
+				uvc_tdr_diag_append(
+					"stream zero_packet_stall consecutive=%d total=%d",
+					tdrusb3_zero_run,
+					tdrusb3_pkt_zero);
+			}
 			continue;
 		}
 		// XXX accessing to pktbuf could lead to crash on the original implementation
@@ -1558,6 +1577,15 @@ uvc_error_t uvc_stream_start_bandwidth(uvc_stream_handle_t *strmh,
 	int transfer_id;
 
 	ctrl = &strmh->cur_ctrl;
+	uvc_tdr_diag_append(
+		"stream_start begin interface=%u format=%u frame=%u interval=%u max_frame=%u max_payload=%u bandwidth=%.2f",
+		ctrl->bInterfaceNumber,
+		ctrl->bFormatIndex,
+		ctrl->bFrameIndex,
+		ctrl->dwFrameInterval,
+		ctrl->dwMaxVideoFrameSize,
+		ctrl->dwMaxPayloadTransferSize,
+		bandwidth_factor);
 
 	UVC_ENTER();
 
@@ -1795,6 +1823,13 @@ uvc_error_t uvc_stream_start_bandwidth(uvc_stream_handle_t *strmh,
 		MARK("Select the altsetting");
 		ret = libusb_set_interface_alt_setting(strmh->devh->usb_devh,
 				altsetting->bInterfaceNumber, altsetting->bAlternateSetting);
+		uvc_tdr_diag_append(
+			"stream_start set_alt interface=%u alt=%u packet_bytes=%zu transfer_bytes=%zu result=%d",
+			altsetting->bInterfaceNumber,
+			altsetting->bAlternateSetting,
+			endpoint_bytes_per_packet,
+			total_transfer_size,
+			ret);
 		if (UNLIKELY(ret != UVC_SUCCESS)) {
 			UVC_DEBUG("libusb_set_interface_alt_setting failed");
 			goto fail;
@@ -1844,6 +1879,10 @@ uvc_error_t uvc_stream_start_bandwidth(uvc_stream_handle_t *strmh,
 	for (transfer_id = 0; transfer_id < LIBUVC_NUM_TRANSFER_BUFS; transfer_id++) {
 		ret = libusb_submit_transfer(strmh->transfers[transfer_id]);
 		if (UNLIKELY(ret != UVC_SUCCESS)) {
+			uvc_tdr_diag_append(
+				"stream_start submit_transfer index=%d result=%d",
+				transfer_id,
+				ret);
 			UVC_DEBUG("libusb_submit_transfer failed");
 			break;
 		}
@@ -1854,9 +1893,11 @@ uvc_error_t uvc_stream_start_bandwidth(uvc_stream_handle_t *strmh,
 		goto fail;
 	}
 
+	uvc_tdr_diag_append("stream_start transfers_submitted count=%d", LIBUVC_NUM_TRANSFER_BUFS);
 	UVC_EXIT(ret);
 	return ret;
 fail:
+	uvc_tdr_diag_append("stream_start failed result=%d", ret);
 	LOGE("fail");
 	strmh->running = 0;
 	UVC_EXIT(ret);

@@ -61,7 +61,7 @@
 #include "android_usbfs.h"
 
 /* Set to 1 to re-enable TDRUSB3 debug logging for USB transfer diagnostics. */
-#define TDRUSB3_DEBUG_LOGS 0
+#define TDRUSB3_DEBUG_LOGS 1
 #if TDRUSB3_DEBUG_LOGS
 #define TDRUSB3_LOGI(...) LOGI(__VA_ARGS__)
 #else

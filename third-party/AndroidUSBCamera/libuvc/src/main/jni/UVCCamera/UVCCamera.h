@@ -188,6 +188,7 @@ public:
 	int setStatusCallback(JNIEnv *env, jobject status_callback_obj);
 	int setButtonCallback(JNIEnv *env, jobject button_callback_obj);
 
+	char *getDiagnostics();
 	char *getSupportedSize();
 	int setPreviewSize(int width, int height, int min_fps, int max_fps, int mode, float bandwidth = DEFAULT_BANDWIDTH);
 	int setPreviewDisplay(ANativeWindow *preview_window);

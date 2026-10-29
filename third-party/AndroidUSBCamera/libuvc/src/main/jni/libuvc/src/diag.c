@@ -44,6 +44,50 @@
 
 #include "libuvc/libuvc.h"
 #include "libuvc/libuvc_internal.h"
+#include <stdarg.h>
+
+#define TDR_DIAG_CAPACITY 8192
+
+static pthread_mutex_t tdr_diag_mutex = PTHREAD_MUTEX_INITIALIZER;
+static char tdr_diag_buffer[TDR_DIAG_CAPACITY];
+static size_t tdr_diag_length;
+
+void uvc_tdr_diag_reset(void) {
+	pthread_mutex_lock(&tdr_diag_mutex);
+	tdr_diag_length = 0;
+	tdr_diag_buffer[0] = '\0';
+	pthread_mutex_unlock(&tdr_diag_mutex);
+}
+
+void uvc_tdr_diag_append(const char *format, ...) {
+	pthread_mutex_lock(&tdr_diag_mutex);
+	if (tdr_diag_length < TDR_DIAG_CAPACITY - 2) {
+		va_list args;
+		va_start(args, format);
+		int written = vsnprintf(
+			tdr_diag_buffer + tdr_diag_length,
+			TDR_DIAG_CAPACITY - tdr_diag_length,
+			format,
+			args);
+		va_end(args);
+		if (written > 0) {
+			size_t available = TDR_DIAG_CAPACITY - tdr_diag_length;
+			tdr_diag_length += (size_t) written < available ? (size_t) written : available - 1;
+			if (tdr_diag_length < TDR_DIAG_CAPACITY - 1) {
+				tdr_diag_buffer[tdr_diag_length++] = '\n';
+				tdr_diag_buffer[tdr_diag_length] = '\0';
+			}
+		}
+	}
+	pthread_mutex_unlock(&tdr_diag_mutex);
+}
+
+char *uvc_tdr_diag_dup(void) {
+	pthread_mutex_lock(&tdr_diag_mutex);
+	char *result = strdup(tdr_diag_buffer);
+	pthread_mutex_unlock(&tdr_diag_mutex);
+	return result;
+}
 
 /** @internal */
 typedef struct _uvc_error_msg {
