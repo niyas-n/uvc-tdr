@@ -251,6 +251,15 @@ typedef struct uvc_device_info {
 
 #define LIBUVC_XFER_BUF_SIZE	( 16 * 1024 * 1024 )
 
+/*
+  usbfs pins every queued isochronous buffer and enforces a process-wide ceiling
+  (usbfs_memory_mb, 16MB by default) shared with every other USB user in the process.
+  A SuperSpeed endpoint moves far more per interval than a high-speed one, so the
+  whole transfer pool has to stay inside a conservative budget or the kernel rejects
+  the submission with an I/O error.
+ */
+#define LIBUVC_TRANSFER_POOL_BUDGET	( 4 * 1024 * 1024 )
+
 struct uvc_stream_handle {
   struct uvc_device_handle *devh;
   struct uvc_stream_handle *prev, *next;

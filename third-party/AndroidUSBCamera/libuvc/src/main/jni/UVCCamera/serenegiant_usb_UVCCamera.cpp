@@ -213,6 +213,22 @@ static jobject nativeGetSupportedSize(JNIEnv *env, jobject thiz,
 	RETURN(result, jobject);
 }
 
+static jobject nativeGetDiagnostics(JNIEnv *env, jobject thiz,
+	ID_TYPE id_camera) {
+
+	ENTER();
+	jstring result = NULL;
+	UVCCamera *camera = reinterpret_cast<UVCCamera *>(id_camera);
+	if (LIKELY(camera)) {
+		char *c_str = camera->getDiagnostics();
+		if (LIKELY(c_str)) {
+			result = env->NewStringUTF(c_str);
+			free(c_str);
+		}
+	}
+	RETURN(result, jobject);
+}
+
 //======================================================================
 // プレビュー画面の大きさをセット
 static jint nativeSetPreviewSize(JNIEnv *env, jobject thiz,
@@ -2035,6 +2051,7 @@ static JNINativeMethod methods[] = {
 	{ "nativeSetStatusCallback",		"(JLcom/jiangdg/uvc/IStatusCallback;)I", (void *) nativeSetStatusCallback },
 	{ "nativeSetButtonCallback",		"(JLcom/jiangdg/uvc/IButtonCallback;)I", (void *) nativeSetButtonCallback },
 
+	{ "nativeGetDiagnostics",			"(J)Ljava/lang/String;", (void *) nativeGetDiagnostics },
 	{ "nativeGetSupportedSize",			"(J)Ljava/lang/String;", (void *) nativeGetSupportedSize },
 	{ "nativeSetPreviewSize",			"(JIIIIIF)I", (void *) nativeSetPreviewSize },
 	{ "nativeStartPreview",				"(J)I", (void *) nativeStartPreview },

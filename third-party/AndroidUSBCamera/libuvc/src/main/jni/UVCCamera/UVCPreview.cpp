@@ -527,6 +527,14 @@ int UVCPreview::prepare_preview(uvc_stream_ctrl_t *ctrl) {
 		frame_format_from_request_mode(requestMode),
 		requestWidth, requestHeight, requestMinFps, requestMaxFps
 	);
+	uvc_tdr_diag_append(
+		"preview negotiate format=%d size=%dx%d fps=%d-%d result=%d",
+		requestMode,
+		requestWidth,
+		requestHeight,
+		requestMinFps,
+		requestMaxFps,
+		result);
 	if (LIKELY(!result)) {
 #if LOCAL_DEBUG
 		uvc_print_stream_ctrl(ctrl, stderr);
@@ -563,6 +571,10 @@ void UVCPreview::do_preview(uvc_stream_ctrl_t *ctrl) {
 	uvc_frame_t *frame_mjpeg = NULL;
 	uvc_error_t result = uvc_start_streaming_bandwidth(
 		mDeviceHandle, ctrl, uvc_preview_frame_callback, (void *)this, requestBandwidth, 0);
+	uvc_tdr_diag_append(
+		"preview start_streaming bandwidth=%.2f result=%d",
+		requestBandwidth,
+		result);
     // jiangdg:fix stopview crash
     // use mHasCapturing flag confirm capture_thread was be created
     mHasCapturing = false;
