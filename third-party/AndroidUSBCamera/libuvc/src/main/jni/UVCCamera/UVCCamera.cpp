@@ -219,6 +219,10 @@ int UVCCamera::release() {
 	RETURN(0, int);
 }
 
+char *UVCCamera::getDiagnostics() {
+	return uvc_tdr_diag_dup();
+}
+
 int UVCCamera::setStatusCallback(JNIEnv *env, jobject status_callback_obj) {
 	ENTER();
 	int result = EXIT_FAILURE;

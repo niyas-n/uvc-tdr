@@ -182,6 +182,10 @@ public class UVCCamera {
     	mSupportedSize = null;
 	}
 
+	public synchronized String getDiagnostics() {
+		return mNativePtr != 0 ? nativeGetDiagnostics(mNativePtr) : "";
+	}
+
     /**
      * connect to a UVC camera
      * USB permission is necessary before this method is called
@@ -1091,6 +1095,7 @@ public class UVCCamera {
 	private static final native int nativeSetButtonCallback(final long mNativePtr, final IButtonCallback callback);
 
 	private static final native int nativeSetPreviewSize(final long id_camera, final int width, final int height, final int min_fps, final int max_fps, final int mode, final float bandwidth);
+	private static final native String nativeGetDiagnostics(final long id_camera);
 	private static final native String nativeGetSupportedSize(final long id_camera);
 	private static final native int nativeStartPreview(final long id_camera);
 	private static final native int nativeStopPreview(final long id_camera);

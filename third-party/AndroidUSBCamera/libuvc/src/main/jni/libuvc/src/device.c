@@ -273,11 +273,18 @@ uvc_error_t uvc_open(uvc_device_t *dev, uvc_device_handle_t **devh) {
 	struct libusb_device_descriptor desc;
 
 	UVC_ENTER();
+	uvc_tdr_diag_reset();
+	uvc_tdr_diag_append(
+		"uvc_open begin bus=%u dev=%u",
+		uvc_get_bus_number(dev),
+		uvc_get_device_address(dev));
 
 	ret = libusb_open(dev->usb_dev, &usb_devh);
 	UVC_DEBUG("libusb_open() = %d", ret);
+	uvc_tdr_diag_append("uvc_open libusb_open result=%d", ret);
 
 	if (UNLIKELY(ret != UVC_SUCCESS)) {
+		uvc_tdr_diag_append("uvc_open failed stage=libusb_open result=%d", ret);
 		UVC_EXIT(ret);
 		return ret;
 	}
@@ -289,10 +296,13 @@ uvc_error_t uvc_open(uvc_device_t *dev, uvc_device_handle_t **devh) {
 	internal_devh->usb_devh = usb_devh;
 	internal_devh->reset_on_release_if = 0;	// XXX
 	ret = uvc_get_device_info(dev, &(internal_devh->info));
+	uvc_tdr_diag_append("uvc_open get_device_info result=%d", ret);
 	pthread_mutex_init(&internal_devh->status_mutex, NULL);	// XXX saki
 
-	if (UNLIKELY(ret != UVC_SUCCESS))
+	if (UNLIKELY(ret != UVC_SUCCESS)) {
+		uvc_tdr_diag_append("uvc_open failed stage=get_device_info result=%d", ret);
 		goto fail2;	// uvc_claim_if was not called yet and we don't need to call uvc_release_if
+	}
 #if !UVC_DETACH_ATTACH
 	/* enable automatic attach/detach kernel driver on supported platforms in libusb */
 	libusb_set_auto_detach_kernel_driver(usb_devh, 1);
@@ -301,8 +311,14 @@ uvc_error_t uvc_open(uvc_device_t *dev, uvc_device_handle_t **devh) {
 			internal_devh->info->ctrl_if.bInterfaceNumber);
 	ret = uvc_claim_if(internal_devh,
 			internal_devh->info->ctrl_if.bInterfaceNumber);
-	if (UNLIKELY(ret != UVC_SUCCESS))
+	uvc_tdr_diag_append(
+		"uvc_open claim_control interface=%d result=%d",
+		internal_devh->info->ctrl_if.bInterfaceNumber,
+		ret);
+	if (UNLIKELY(ret != UVC_SUCCESS)) {
+		uvc_tdr_diag_append("uvc_open failed stage=claim_control result=%d", ret);
 		goto fail;
+	}
 
 	libusb_get_device_descriptor(dev->usb_dev, &desc);
 	internal_devh->is_isight = (desc.idVendor == 0x05ac && desc.idProduct == 0x8501);
@@ -321,13 +337,19 @@ uvc_error_t uvc_open(uvc_device_t *dev, uvc_device_handle_t **devh) {
 				_uvc_status_callback, internal_devh, 0);
 		ret = libusb_submit_transfer(internal_devh->status_xfer);
 		UVC_DEBUG("libusb_submit_transfer() = %d", ret);
+		uvc_tdr_diag_append(
+			"uvc_open submit_status endpoint=0x%02x result=%d",
+			internal_devh->info->ctrl_if.bEndpointAddress,
+			ret);
 
 		if (UNLIKELY(ret)) {
 			LOGE("device has a status interrupt endpoint, but unable to read from it");
+			uvc_tdr_diag_append("uvc_open failed stage=submit_status result=%d", ret);
 			goto fail;
 		}
 	} else {
 		LOGE("internal_devh->info->ctrl_if.bEndpointAddress is null");
+		uvc_tdr_diag_append("uvc_open status_endpoint=none");
 	}
 
 	if (dev->ctx->own_usb_ctx && dev->ctx->open_devices == NULL) {
@@ -337,6 +359,7 @@ uvc_error_t uvc_open(uvc_device_t *dev, uvc_device_handle_t **devh) {
 
 	DL_APPEND(dev->ctx->open_devices, internal_devh);
 	*devh = internal_devh;
+	uvc_tdr_diag_append("uvc_open success");
 
 	UVC_EXIT(ret);
 
