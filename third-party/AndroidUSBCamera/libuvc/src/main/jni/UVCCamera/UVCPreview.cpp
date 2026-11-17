@@ -436,8 +436,12 @@ void UVCPreview::uvc_preview_frame_callback(uvc_frame_t *frame, void *vptr_args)
 	UVCPreview *preview = reinterpret_cast<UVCPreview *>(vptr_args);
 	if UNLIKELY(!preview->isRunning() || !frame || !frame->frame_format || !frame->data || !frame->data_bytes) return;
 	const size_t minBytes = frame_payload_bytes(preview->requestMode, preview->requestWidth, preview->requestHeight);
+	const bool invalidFixedSizeFrame =
+		preview->requestMode == 2
+			? frame->actual_bytes != minBytes
+			: frame->actual_bytes < minBytes;
 	if (UNLIKELY(
-		((frame->frame_format != UVC_FRAME_FORMAT_MJPEG) && (frame->actual_bytes < minBytes))
+		((frame->frame_format != UVC_FRAME_FORMAT_MJPEG) && invalidFixedSizeFrame)
 		|| (frame->width != preview->frameWidth) || (frame->height != preview->frameHeight) )) {
 
 #if LOCAL_DEBUG
