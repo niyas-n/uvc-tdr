@@ -353,7 +353,7 @@ public class UVCCamera {
 		if (mNativePtr != 0) {
 			final int result = nativeSetPreviewSize(mNativePtr, width, height, min_fps, max_fps, frameFormat, bandwidthFactor);
 			if (result != 0)
-				throw new IllegalArgumentException("Failed to set preview size");
+				throw new IllegalArgumentException("Failed to set preview size: result=" + result);
 			mCurrentFrameFormat = frameFormat;
 			mCurrentWidth = width;
 			mCurrentHeight = height;
@@ -450,7 +450,9 @@ public class UVCCamera {
      */
     public synchronized void startPreview() {
     	if (mCtrlBlock != null) {
-    		nativeStartPreview(mNativePtr);
+    		final int result = nativeStartPreview(mNativePtr);
+    		if (result != 0)
+    			throw new IllegalStateException("Failed to start preview: result=" + result);
     	}
     }
 

@@ -1026,8 +1026,9 @@ static inline void _uvc_process_payload_iso(uvc_stream_handle_t *strmh, struct l
 		// because the substances of pktbuf will be deleted in uvc_stream_stop.
 		pktbuf = libusb_get_iso_packet_buffer_simple(transfer, packet_id);
 		if (LIKELY(pktbuf)) {	// XXX add null check because libusb_get_iso_packet_buffer_simple could return null
-			/* A long silence means the camera stalled and likely dropped
-			 * data, so the continuous segment restarts at this packet. */
+			/* A long silence means data delivery paused. Keep the partial frame:
+			 * this camera can resume the same frame after thousands of empty
+			 * isochronous packets, so the gap is not a frame boundary. */
 			if (tdrusb3_zero_run >= TDRUSB3_STALL_ZERO_RUN)
 				tdrusb3_segment_start_offset = strmh->got_bytes;
 			tdrusb3_zero_run = 0;
@@ -1873,6 +1874,15 @@ uvc_error_t uvc_stream_start_bandwidth(uvc_stream_handle_t *strmh,
 			ret);
 		if (UNLIKELY(ret != UVC_SUCCESS)) {
 			UVC_DEBUG("libusb_set_interface_alt_setting failed");
+			const int idle_result =
+				libusb_set_interface_alt_setting(
+					strmh->devh->usb_devh,
+					altsetting->bInterfaceNumber,
+					0);
+			uvc_tdr_diag_append(
+				"stream_start reset_alt interface=%u alt=0 result=%d",
+				altsetting->bInterfaceNumber,
+				idle_result);
 			goto fail;
 		}
 

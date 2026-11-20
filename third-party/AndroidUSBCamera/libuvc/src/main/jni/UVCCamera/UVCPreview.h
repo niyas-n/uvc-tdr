@@ -61,12 +61,17 @@ private:
 	int requestWidth, requestHeight, requestMode;
 	int requestMinFps, requestMaxFps;
 	float requestBandwidth;
+	uvc_stream_ctrl_t requestCtrl;
+	bool requestCtrlValid;
 	int frameWidth, frameHeight;
 	int frameMode;
 	size_t frameBytes;
 	pthread_t preview_thread;
+	bool previewThreadCreated;
 	pthread_mutex_t preview_mutex;
 	pthread_cond_t preview_sync;
+	int previewStartResult;
+	bool previewStartCompleted;
 	ObjectArray<uvc_frame_t *> previewFrames;
 	int previewFormat;
 	size_t previewBytes;
@@ -75,6 +80,7 @@ private:
 	volatile bool mHasCapturing;
 	ANativeWindow *mCaptureWindow;
 	pthread_t capture_thread;
+	bool captureThreadCreated;
 	pthread_mutex_t capture_mutex;
 	pthread_cond_t capture_sync;
 	// 声明时间的 attr
@@ -100,7 +106,8 @@ private:
 	void clearPreviewFrame();
 	static void *preview_thread_func(void *vptr_args);
 	int prepare_preview(uvc_stream_ctrl_t *ctrl);
-	void do_preview(uvc_stream_ctrl_t *ctrl);
+	int do_preview(uvc_stream_ctrl_t *ctrl);
+	void completePreviewStart(int result);
 	uvc_frame_t *draw_preview_one(uvc_frame_t *frame, ANativeWindow **window, convFunc_t func, int pixelBytes);
 //
 	void addCaptureFrame(uvc_frame_t *frame);
