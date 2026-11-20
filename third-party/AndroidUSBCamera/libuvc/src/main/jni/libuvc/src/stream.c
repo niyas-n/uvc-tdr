@@ -68,7 +68,7 @@
 #endif
 
 /* Set to 1 to re-enable TDRUSB3 debug logging for stream diagnostics. */
-#define TDRUSB3_DEBUG_LOGS 1
+#define TDRUSB3_DEBUG_LOGS 0
 #if TDRUSB3_DEBUG_LOGS
 #define TDRUSB3_LOGI(...) LOGI(__VA_ARGS__)
 #else
@@ -85,6 +85,7 @@ static int tdrusb3_pkt_status_err;
 static int tdrusb3_pkt_hdr_err;
 static int tdrusb3_clear_halt_calls;
 static const char *tdrusb3_publish_reason = "none";
+static int tdrusb3_dropped_frame_count;
 /* Exact size of a complete raw frame (0 when unknown), set at stream start. */
 static size_t tdrusb3_exact_frame_bytes;
 /* Offset in outbuf where the last continuously-received segment started.
@@ -689,18 +690,22 @@ static void _uvc_swap_buffers(uvc_stream_handle_t *strmh) {
 		tdrusb3_frame_log_count++;
 		if (tdrusb3_frame_log_count == 1) {
 			uvc_tdr_diag_append(
-				"stream first_frame bytes=%zu expected=%u bfh_err=%d data_packets=%d zero_packets=%d status_errors=%d header_errors=%d",
+				"stream first_frame bytes=%zu expected=%zu bfh_err=%d data_packets=%d zero_packets=%d status_errors=%d header_errors=%d",
 				strmh->got_bytes,
-				strmh->cur_ctrl.dwMaxVideoFrameSize,
+				tdrusb3_exact_frame_bytes
+					? tdrusb3_exact_frame_bytes
+					: (size_t)strmh->cur_ctrl.dwMaxVideoFrameSize,
 				strmh->bfh_err,
 				tdrusb3_pkt_data,
 				tdrusb3_pkt_zero,
 				tdrusb3_pkt_status_err,
 				tdrusb3_pkt_hdr_err);
 		}
-		TDRUSB3_LOGI("TDRUSB3 publish frame seq=%d bytes=%zu expected=%u reason=%s bfh_err=%d seg_start=%zu pkts data=%d zero=%d status_err=%d hdr_err=%d clear_halt=%d",
+		TDRUSB3_LOGI("TDRUSB3 publish frame seq=%d bytes=%zu expected=%zu reason=%s bfh_err=%d seg_start=%zu pkts data=%d zero=%d status_err=%d hdr_err=%d clear_halt=%d",
 			tdrusb3_frame_log_count, strmh->got_bytes,
-			strmh->cur_ctrl.dwMaxVideoFrameSize,
+			tdrusb3_exact_frame_bytes
+				? tdrusb3_exact_frame_bytes
+				: (size_t)strmh->cur_ctrl.dwMaxVideoFrameSize,
 			tdrusb3_publish_reason, strmh->bfh_err,
 			tdrusb3_segment_start_offset,
 			tdrusb3_pkt_data, tdrusb3_pkt_zero,
@@ -927,6 +932,48 @@ static void tdrusb3_trim_to_exact_tail(uvc_stream_handle_t *strmh) {
 	strmh->got_bytes = tdrusb3_exact_frame_bytes;
 }
 
+static void tdrusb3_discard_frame(uvc_stream_handle_t *strmh, const char *reason) {
+	tdrusb3_dropped_frame_count++;
+	if (tdrusb3_dropped_frame_count == 1) {
+		uvc_tdr_diag_append(
+			"stream dropped_frame bytes=%zu expected=%zu reason=%s bfh_err=%d",
+			strmh->got_bytes,
+			tdrusb3_exact_frame_bytes,
+			reason,
+			strmh->bfh_err);
+	}
+	TDRUSB3_LOGI("TDRUSB3 discard frame bytes=%zu expected=%zu reason=%s bfh_err=%d",
+		strmh->got_bytes, tdrusb3_exact_frame_bytes, reason, strmh->bfh_err);
+	strmh->got_bytes = 0;
+	strmh->last_scr = 0;
+	strmh->pts = 0;
+	strmh->bfh_err = 0;
+	tdrusb3_pkt_data = 0;
+	tdrusb3_pkt_zero = 0;
+	tdrusb3_pkt_status_err = 0;
+	tdrusb3_pkt_hdr_err = 0;
+	tdrusb3_clear_halt_calls = 0;
+	tdrusb3_publish_reason = "none";
+	tdrusb3_segment_start_offset = 0;
+	tdrusb3_zero_run = 0;
+}
+
+static void tdrusb3_finish_frame(uvc_stream_handle_t *strmh, const char *reason) {
+	if (!tdrusb3_exact_frame_bytes) {
+		tdrusb3_publish_reason = reason;
+		_uvc_swap_buffers(strmh);
+		return;
+	}
+
+	tdrusb3_trim_to_exact_tail(strmh);
+	if (strmh->got_bytes == tdrusb3_exact_frame_bytes && !strmh->bfh_err) {
+		tdrusb3_publish_reason = reason;
+		_uvc_swap_buffers(strmh);
+	} else {
+		tdrusb3_discard_frame(strmh, reason);
+	}
+}
+
 static inline void _uvc_process_payload_iso(uvc_stream_handle_t *strmh, struct libusb_transfer *transfer) {
 	/* per packet */
 	uint8_t *pktbuf;
@@ -952,11 +999,9 @@ static inline void _uvc_process_payload_iso(uvc_stream_handle_t *strmh, struct l
 			MARK("bad packet:status=%d,actual_length=%d", pkt->status, pkt->actual_length);
 			strmh->bfh_err |= UVC_STREAM_ERR;
 			tdrusb3_pkt_status_err++;
-			tdrusb3_clear_halt_calls++;
 			/* this packet's data is lost, so the continuous segment restarts */
 			tdrusb3_segment_start_offset = strmh->got_bytes;
 			tdrusb3_zero_run = 0;
-			libusb_clear_halt(strmh->devh->usb_devh, strmh->stream_if->bEndpointAddress);
 //			uvc_vc_get_error_code(strmh->devh, &vc_error_code, UVC_GET_CUR);
 //			uvc_vs_get_error_code(strmh->devh, &vs_error_code, UVC_GET_CUR);
 			continue;
@@ -981,8 +1026,9 @@ static inline void _uvc_process_payload_iso(uvc_stream_handle_t *strmh, struct l
 		// because the substances of pktbuf will be deleted in uvc_stream_stop.
 		pktbuf = libusb_get_iso_packet_buffer_simple(transfer, packet_id);
 		if (LIKELY(pktbuf)) {	// XXX add null check because libusb_get_iso_packet_buffer_simple could return null
-			/* A long silence means the camera stalled and likely dropped
-			 * data, so the continuous segment restarts at this packet. */
+			/* A long silence means data delivery paused. Keep the partial frame:
+			 * this camera can resume the same frame after thousands of empty
+			 * isochronous packets, so the gap is not a frame boundary. */
 			if (tdrusb3_zero_run >= TDRUSB3_STALL_ZERO_RUN)
 				tdrusb3_segment_start_offset = strmh->got_bytes;
 			tdrusb3_zero_run = 0;
@@ -1009,13 +1055,11 @@ static inline void _uvc_process_payload_iso(uvc_stream_handle_t *strmh, struct l
 			if (LIKELY(check_header)) {
 				header_info = pktbuf[1];
 				if (UNLIKELY(header_info & UVC_STREAM_ERR)) {
-//					strmh->bfh_err |= UVC_STREAM_ERR;
+					strmh->bfh_err |= UVC_STREAM_ERR;
 					MARK("bad packet:status=0x%2x", header_info);
 					tdrusb3_pkt_hdr_err++;
-					tdrusb3_clear_halt_calls++;
 					/* this packet is discarded, so the segment restarts */
 					tdrusb3_segment_start_offset = strmh->got_bytes;
-					libusb_clear_halt(strmh->devh->usb_devh, strmh->stream_if->bEndpointAddress);
 //					uvc_vc_get_error_code(strmh->devh, &vc_error_code, UVC_GET_CUR);
 					uvc_vs_get_error_code(strmh->devh, &vs_error_code, UVC_GET_CUR);
 					continue;
@@ -1025,9 +1069,7 @@ static inline void _uvc_process_payload_iso(uvc_stream_handle_t *strmh, struct l
 				/* The frame ID bit was flipped, but we have image data sitting
 	             around from prior transfers. This means the camera didn't send
     		     an EOF for the last transfer of the previous frame or some frames losted. */
-					tdrusb3_publish_reason = "fid_toggle";
-					tdrusb3_trim_to_exact_tail(strmh);
-					_uvc_swap_buffers(strmh);
+					tdrusb3_finish_frame(strmh, "fid_toggle");
 				}
 				strmh->fid = header_info & UVC_STREAM_FID;
 #else
@@ -1041,10 +1083,8 @@ static inline void _uvc_process_payload_iso(uvc_stream_handle_t *strmh, struct l
 					if (LIKELY(header_len >= 6)) {
 						const uint32_t new_pts = DW_TO_INT(pktbuf + 2);
 
-						/* PTS changes exactly when a new frame starts, so a
-						 * change marks a frame boundary inside the buffer. */
-						if (new_pts != strmh->pts)
-							tdrusb3_segment_start_offset = strmh->got_bytes;
+						if (strmh->pts && new_pts != strmh->pts && strmh->got_bytes)
+							tdrusb3_finish_frame(strmh, "pts_change");
 						strmh->pts = new_pts;
 					} else {
 						MARK("bogus packet: header info has UVC_STREAM_PTS, but no data");
@@ -1094,13 +1134,14 @@ static inline void _uvc_process_payload_iso(uvc_stream_handle_t *strmh, struct l
 				memcpy(strmh->outbuf + strmh->got_bytes, pktbuf + header_len, odd_bytes);
 				strmh->got_bytes += odd_bytes;
 				tdrusb3_pkt_data++;
+				if (tdrusb3_exact_frame_bytes
+						&& strmh->got_bytes == tdrusb3_exact_frame_bytes
+						&& !strmh->bfh_err)
+					tdrusb3_finish_frame(strmh, "exact_size");
 			}
 #ifdef USE_EOF
 			if ((pktbuf[1] & UVC_STREAM_EOF) && strmh->got_bytes != 0) {
-				tdrusb3_trim_to_exact_tail(strmh);
-				/* The EOF bit is set, so publish the complete frame */
-				tdrusb3_publish_reason = "eof";
-				_uvc_swap_buffers(strmh);
+				tdrusb3_finish_frame(strmh, "eof");
 			}
 #endif
 		} else {	// if (LIKELY(pktbuf))
@@ -1605,6 +1646,7 @@ uvc_error_t uvc_stream_start_bandwidth(uvc_stream_handle_t *strmh,
 	tdrusb3_pkt_hdr_err = 0;
 	tdrusb3_clear_halt_calls = 0;
 	tdrusb3_publish_reason = "none";
+	tdrusb3_dropped_frame_count = 0;
 	tdrusb3_segment_start_offset = 0;
 	tdrusb3_zero_run = 0;
 	strmh->pts = 0;
@@ -1832,6 +1874,15 @@ uvc_error_t uvc_stream_start_bandwidth(uvc_stream_handle_t *strmh,
 			ret);
 		if (UNLIKELY(ret != UVC_SUCCESS)) {
 			UVC_DEBUG("libusb_set_interface_alt_setting failed");
+			const int idle_result =
+				libusb_set_interface_alt_setting(
+					strmh->devh->usb_devh,
+					altsetting->bInterfaceNumber,
+					0);
+			uvc_tdr_diag_append(
+				"stream_start reset_alt interface=%u alt=0 result=%d",
+				altsetting->bInterfaceNumber,
+				idle_result);
 			goto fail;
 		}
 
